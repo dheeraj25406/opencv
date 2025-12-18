@@ -1837,24 +1837,33 @@ bool CvCapture_FFMPEG::retrieveFrame(int flag, unsigned char** data, int* step, 
         *height = 1;
         *cn = 1;
         *depth = CV_8U;
-        return  ret;
+        return ret;
     }
 
     AVFrame* sw_picture = picture;
+    bool owns_sw_picture = false;
+
 #if USE_AV_HW_CODECS
-    // if hardware frame, copy it to system memory
     if (picture && picture->hw_frames_ctx) {
         sw_picture = av_frame_alloc();
-        //if (av_hwframe_map(sw_picture, picture, AV_HWFRAME_MAP_READ) < 0) {
+        if (!sw_picture)
+            return false;
+        owns_sw_picture = true;
         if (av_hwframe_transfer_data(sw_picture, picture, 0) < 0) {
             CV_LOG_ERROR(NULL, "Error copying data from GPU to CPU (av_hwframe_transfer_data)");
+            av_frame_free(&sw_picture);
             return false;
         }
     }
 #endif
 
-    if (!sw_picture || !sw_picture->data[0])
+    if (!sw_picture || !sw_picture->data[0]) {
+#if USE_AV_HW_CODECS
+        if (owns_sw_picture)
+            av_frame_free(&sw_picture);
+#endif
         return false;
+    }
 
 #if LIBAVUTIL_BUILD >= CALC_FFMPEG_VERSION(56, 72, 0)
     const char* color_space_name = av_color_space_name(sw_picture->colorspace);
@@ -1867,6 +1876,7 @@ bool CvCapture_FFMPEG::retrieveFrame(int flag, unsigned char** data, int* step, 
         << ", primaries: " << av_color_primaries_name(sw_picture->color_primaries)
         << ", transfer: " << av_color_transfer_name(sw_picture->color_trc)
     );
+
     const AVPixelFormat result_format = convertRGB ? AV_PIX_FMT_BGR24 : (AVPixelFormat)sw_picture->format;
     switch (result_format)
     {
@@ -1878,19 +1888,18 @@ bool CvCapture_FFMPEG::retrieveFrame(int flag, unsigned char** data, int* step, 
                        << ", will be treated as 8UC1.");
         *depth = CV_8U;
         *cn = 1;
-        break; // TODO: return false?
+        break;
     }
 
-    if( img_convert_ctx == NULL ||
+    if (img_convert_ctx == NULL ||
         frame.width != video_st->CV_FFMPEG_CODEC_FIELD->width ||
         frame.height != video_st->CV_FFMPEG_CODEC_FIELD->height ||
-        frame.data == NULL )
+        frame.data == NULL)
     {
 #if LIBSWSCALE_BUILD >= CALC_FFMPEG_VERSION(6, 4, 100)
         int buffer_width = video_st->CV_FFMPEG_CODEC_FIELD->width;
         int buffer_height = video_st->CV_FFMPEG_CODEC_FIELD->height;
 
-        // Reproduce sws_getCachedContext but with threads option
         int64_t src_h_chr_pos = -513, dst_h_chr_pos = -513,
                 src_v_chr_pos = -513, dst_v_chr_pos = -513;
         if (img_convert_ctx)
@@ -1904,8 +1913,13 @@ bool CvCapture_FFMPEG::retrieveFrame(int flag, unsigned char** data, int* step, 
         }
 
         img_convert_ctx = sws_alloc_context();
-        if (img_convert_ctx == NULL)
-            return false;//CV_Error(0, "Cannot initialize the conversion context!");
+        if (!img_convert_ctx) {
+#if USE_AV_HW_CODECS
+            if (owns_sw_picture)
+                av_frame_free(&sw_picture);
+#endif
+            return false;
+        }
 
         av_opt_set_int(img_convert_ctx, "sws_flags", SWS_BICUBIC, 0);
         av_opt_set_int(img_convert_ctx, "threads", requestedThreads, 0);
@@ -1928,46 +1942,48 @@ bool CvCapture_FFMPEG::retrieveFrame(int flag, unsigned char** data, int* step, 
             if (sws_init_context(img_convert_ctx, NULL, NULL) < 0) {
                 sws_freeContext(img_convert_ctx);
                 img_convert_ctx = NULL;
+#if USE_AV_HW_CODECS
+                if (owns_sw_picture)
+                    av_frame_free(&sw_picture);
+#endif
+                return false;
             }
         }
 #else
-        // Some sws_scale optimizations have some assumptions about alignment of data/step/width/height
-        // Also we use coded_width/height to workaround problem with legacy ffmpeg versions (like n0.8)
         int buffer_width = context->coded_width, buffer_height = context->coded_height;
-
         img_convert_ctx = sws_getCachedContext(
-                img_convert_ctx,
-                buffer_width, buffer_height,
-                (AVPixelFormat)sw_picture->format,
-                buffer_width, buffer_height,
-                result_format,
-                SWS_BICUBIC,
-                NULL, NULL, NULL
-                );
+            img_convert_ctx,
+            buffer_width, buffer_height,
+            (AVPixelFormat)sw_picture->format,
+            buffer_width, buffer_height,
+            result_format,
+            SWS_BICUBIC,
+            NULL, NULL, NULL
+        );
 #endif
 
-        if (img_convert_ctx == NULL)
-            return false;//CV_Error(0, "Cannot initialize the conversion context!");
+        if (!img_convert_ctx) {
+#if USE_AV_HW_CODECS
+            if (owns_sw_picture)
+                av_frame_free(&sw_picture);
+#endif
+            return false;
+        }
 
 #if USE_AV_FRAME_GET_BUFFER
         av_frame_unref(&rgb_picture);
         rgb_picture.format = result_format;
         rgb_picture.width = buffer_width;
         rgb_picture.height = buffer_height;
-        if (0 != av_frame_get_buffer(&rgb_picture, 32))
-        {
-            CV_WARN("OutOfMemory");
+        if (av_frame_get_buffer(&rgb_picture, 32) != 0) {
+#if USE_AV_HW_CODECS
+            if (owns_sw_picture)
+                av_frame_free(&sw_picture);
+#endif
             return false;
         }
-#else
-        int aligns[AV_NUM_DATA_POINTERS];
-        avcodec_align_dimensions2(video_st->codec, &buffer_width, &buffer_height, aligns);
-        rgb_picture.data[0] = (uint8_t*)realloc(rgb_picture.data[0],
-                _opencv_ffmpeg_av_image_get_buffer_size( result_format,
-                                    buffer_width, buffer_height ));
-        _opencv_ffmpeg_av_image_fill_arrays(&rgb_picture, rgb_picture.data[0],
-                        result_format, buffer_width, buffer_height );
 #endif
+
         frame.width = video_st->CV_FFMPEG_CODEC_FIELD->width;
         frame.height = video_st->CV_FFMPEG_CODEC_FIELD->height;
         frame.data = rgb_picture.data[0];
@@ -1977,14 +1993,8 @@ bool CvCapture_FFMPEG::retrieveFrame(int flag, unsigned char** data, int* step, 
 #if LIBSWSCALE_BUILD >= CALC_FFMPEG_VERSION(6, 4, 100)
     sws_scale_frame(img_convert_ctx, &rgb_picture, sw_picture);
 #else
-    sws_scale(
-            img_convert_ctx,
-            sw_picture->data,
-            sw_picture->linesize,
-            0, sw_picture->height,
-            rgb_picture.data,
-            rgb_picture.linesize
-            );
+    sws_scale(img_convert_ctx, sw_picture->data, sw_picture->linesize, 0,
+              sw_picture->height, rgb_picture.data, rgb_picture.linesize);
 #endif
 
     *data = frame.data;
@@ -1993,10 +2003,8 @@ bool CvCapture_FFMPEG::retrieveFrame(int flag, unsigned char** data, int* step, 
     *height = frame.height;
 
 #if USE_AV_HW_CODECS
-    if (sw_picture != picture)
-    {
+    if (owns_sw_picture)
         av_frame_free(&sw_picture);
-    }
 #endif
     return true;
 }
